@@ -44,6 +44,77 @@ def table(df):
     return t
 
 
+def paired(df, baseline):
+    """Per-seed paired comparison against `baseline` (same traces => paired samples)."""
+    b = df[df.router_name == baseline].set_index("seed").mean_e2e
+    rows = []
+    for name, g in df.groupby("router_name"):
+        if name == baseline:
+            continue
+        a = g.set_index("seed").mean_e2e
+        common = a.index.intersection(b.index)
+        if len(common) == 0:
+            continue
+        ratio = (a[common] / b[common]).values  # < 1 means faster than baseline
+        lo, hi = np.exp(bootstrap_ci(np.log(ratio)))
+        rows.append({"router": name, f"RT / {baseline} (geo-mean)": float(np.exp(np.log(ratio).mean())),
+                     "ci90": f"[{lo:.3f}, {hi:.3f}]",
+                     f"seeds faster than {baseline}": f"{int((ratio < 1).sum())}/{len(ratio)}"})
+    return pd.DataFrame(rows).sort_values(f"RT / {baseline} (geo-mean)") if rows else pd.DataFrame()
+
+
+def plot_sweep(df, path, title):
+    """Fig.-10-style panels: HRA mean RT vs decode-to-prefill ratio r and vs safety margin m."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    c = LIGHT
+    panels = []
+    for key, label, default in [("HRA_R", "decode-to-prefill ratio r", 0.6), ("HRA_M", "safety margin m (fraction of blocks)", 0.03)]:
+        pts = []
+        for name, g in df.groupby("router_name"):
+            if name == "glia_hra":
+                v = default
+            elif name.startswith(f"glia_hra__{key}"):
+                v = float(name[len(f"glia_hra__{key}"):])
+            else:
+                continue
+            lo, hi = bootstrap_ci(g.mean_e2e)
+            pts.append((v, g.mean_e2e.mean(), lo, hi, g.frac_restarted.mean()))
+        if len(pts) > 1:
+            panels.append((label, default, sorted(pts)))
+    if not panels:
+        return
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 3.2), dpi=150, sharey=True)
+    axes = np.atleast_1d(axes)
+    fig.patch.set_facecolor(c["surface"])
+    for ax, (label, default, pts) in zip(axes, panels):
+        x, m, lo, hi, rs = map(np.array, zip(*pts))
+        ax.set_facecolor(c["surface"])
+        ax.fill_between(x, lo, hi, color=c["ours"], alpha=0.10, linewidth=0)
+        ax.plot(x, m, color=c["ours"], linewidth=2, marker="o", markersize=6, markeredgecolor=c["surface"],
+                markeredgewidth=2)
+        for xi, mi, ri in zip(x, m, rs):
+            ax.annotate(f"{ri:.0%} restarted", (xi, mi), textcoords="offset points", xytext=(0, 9), ha="center",
+                        fontsize=7, color=c["muted"])
+        ax.axvline(default, color=c["axis"], linewidth=1)
+        ax.text(default, 0.02, " paper default", transform=ax.get_xaxis_transform(), fontsize=7, color=c["muted"])
+        ax.set_xlabel(label, color=c["ink2"], fontsize=9)
+        ax.set_ylim(0, max(hi) * 1.25)
+        ax.grid(axis="y", color=c["grid"], linewidth=1)
+        ax.set_axisbelow(True)
+        for sp in ["top", "right", "left"]:
+            ax.spines[sp].set_visible(False)
+        ax.spines["bottom"].set_color(c["axis"])
+        ax.tick_params(colors=c["muted"], length=0, labelsize=8)
+    axes[0].set_ylabel("HRA mean RT (s), 10 seeds, 90% CI", color=c["ink2"], fontsize=9)
+    fig.suptitle(title, color=c["ink"], fontsize=10, x=0.02, ha="left")
+    fig.tight_layout()
+    fig.savefig(path, facecolor=c["surface"])
+    plt.close(fig)
+
+
 def plot(df, t, path, title):
     import matplotlib
     matplotlib.use("Agg")
@@ -91,6 +162,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
     ap.add_argument("--title", default=None)
+    ap.add_argument("--paired", nargs="*", default=["llq", "glia_hra"], help="baselines for paired comparison")
     args = ap.parse_args()
     df = load(args.tag)
     t = table(df)
@@ -98,8 +170,17 @@ def main():
     t.to_csv(os.path.join(out, "summary.csv"), index=False)
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write(t.to_markdown(index=False, floatfmt=".2f"))
-    plot(df, t, os.path.join(out, "mean_rt.png"), args.title or f"Mean RT, workload: {args.tag}")
+    main_df = df[~df.router_name.str.contains("__")]  # parameter-sweep variants go in their own chart
+    plot(main_df, t[t.router.isin(set(main_df.router_name))], os.path.join(out, "mean_rt.png"),
+         args.title or f"Mean RT, workload: {args.tag}")
+    plot_sweep(df, os.path.join(out, "hra_sensitivity.png"), "HRA parameter sensitivity (cf. Glia Fig. 10)")
     print(t.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    with open(os.path.join(out, "summary.md"), "a") as f:
+        for base in args.paired:
+            if base in set(df.router_name):
+                p = paired(df, base)
+                print(f"\nPaired vs {base}:\n" + p.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+                f.write(f"\n\nPaired per-seed comparison vs `{base}`:\n\n" + p.to_markdown(index=False, floatfmt=".3f"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+{
+  "num_requests": 7403,
+  "num_completed": 7403,
+  "mean_e2e": 59.647531311869,
+  "p50_e2e": 30.141012356033798,
+  "p90_e2e": 162.5243387932725,
+  "p99_e2e": 305.1018633348961,
+  "mean_ttft": 35.035841559687704,
+  "p90_ttft": 115.30521891348124,
+  "mean_global_queue_delay": 0.0,
+  "frac_restarted": 0.1715520734837228,
+  "mean_restarts": 0.2236930973929488,
+  "makespan": 1404.7377516978631,
+  "num_blocks_per_replica": 3072,
+  "wall_seconds": 23.873303174972534,
+  "router": "llq",
+  "trace": "/home/user/glia-repro/data/traces/first_turn/sharegpt_first_turn_7.5_seed8.csv",
+  "env": {},
+  "num_blocks": 3072
+}

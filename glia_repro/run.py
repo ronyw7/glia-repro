@@ -1,8 +1,9 @@
 """Benchmark routers over the 10-seed Glia workload.
 
 Examples
-  python -m glia_repro.run --routers llq rr lor routers/glia_hra.py --workload first_turn
-  python -m glia_repro.run --routers routers/my_router.py --workload first_turn --seeds 0 1 2
+  python -m glia_repro.run --routers llq rr lor routers/glia_hra.py            # paper-calibrated setting
+  python -m glia_repro.run --routers routers/my_router.py --seeds 0 1 2       # quick check of a new router
+  python -m glia_repro.run --routers llq routers/glia_hra.py --num_blocks 4096 # Vidur-default memory
 """
 import argparse
 import glob
@@ -52,14 +53,16 @@ def main():
     ap.add_argument("--workload", default="first_turn", help="subdir of data/traces")
     ap.add_argument("--qps", default="7.5")
     ap.add_argument("--seeds", type=int, nargs="+", default=list(range(10)))
-    ap.add_argument("--tag", default=None, help="results/<tag>/ (default: workload)")
+    ap.add_argument("--tag", default=None, help="results/<tag>/ (default: <workload>_kv<num_blocks>)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
     ap.add_argument("--env", nargs="*", default=[], help="KEY=VALUE env vars for routers (e.g. HRA_R=0.4)")
-    ap.add_argument("--num_blocks", type=int, default=None, help="override KV blocks per replica")
+    ap.add_argument("--num_blocks", type=int, default=3328,
+                    help="KV-cache blocks per replica. 3328 = calibrated so LLQ matches the paper's baseline; "
+                         "4096 = Vidur's memory planner for A10/24GB; 2048 ~ real vLLM on a 24GB A10")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    tag = args.tag or args.workload
+    tag = args.tag or f"{args.workload}_kv{args.num_blocks}"
     env = dict(kv.split("=", 1) for kv in args.env)
     env_sfx = ("__" + "_".join(f"{k}{v}" for k, v in sorted(env.items()))) if env else ""
     jobs = []
@@ -68,9 +71,7 @@ def main():
                              f"sharegpt_{args.workload}_{args.qps}_seed{seed}.csv")
         assert os.path.exists(trace), trace
         out_dir = os.path.join(REPO, "results", tag, _router_name(router) + env_sfx, f"seed{seed}")
-        kw = {"force": args.force}
-        if args.num_blocks:
-            kw["num_blocks"] = args.num_blocks
+        kw = {"force": args.force, "num_blocks": args.num_blocks}
         jobs.append((router, trace, out_dir, env, kw))
 
     ctx = mp.get_context("fork")
