@@ -1,0 +1,352 @@
+diff --git a/vidur/config/config.py b/vidur/config/config.py
+index 9452180..c191ddd 100644
+--- a/vidur/config/config.py
++++ b/vidur/config/config.py
+@@ -490,6 +490,31 @@ class LORGlobalSchedulerConfig(BaseGlobalSchedulerConfig):
+         return GlobalSchedulerType.LOR
+ 
+ 
++@dataclass
++class LLQGlobalSchedulerConfig(BaseGlobalSchedulerConfig):
++    @staticmethod
++    def get_type():
++        return GlobalSchedulerType.LLQ
++
++
++@dataclass
++class CustomGlobalSchedulerConfig(BaseGlobalSchedulerConfig):
++    """Load a BaseGlobalScheduler subclass from an arbitrary python file."""
++
++    module_path: str = field(
++        default="",
++        metadata={"help": "Path to a .py file defining the global scheduler class."},
++    )
++    class_name: str = field(
++        default="",
++        metadata={"help": "Class name; if empty, the only BaseGlobalScheduler subclass in the file."},
++    )
++
++    @staticmethod
++    def get_type():
++        return GlobalSchedulerType.CUSTOM
++
++
+ @dataclass
+ class BaseExecutionTimePredictorConfig(BasePolyConfig):
+     compute_input_file: str = field(
+diff --git a/vidur/config/device_sku_config.py b/vidur/config/device_sku_config.py
+index 8ac9bf5..5d80a05 100644
+--- a/vidur/config/device_sku_config.py
++++ b/vidur/config/device_sku_config.py
+@@ -23,6 +23,16 @@ class A40DeviceSKUConfig(BaseDeviceSKUConfig):
+         return DeviceSKUType.A40
+ 
+ 
++@dataclass
++class A10DeviceSKUConfig(BaseDeviceSKUConfig):
++    fp16_tflops: int = 125
++    total_memory_gb: int = 24
++
++    @staticmethod
++    def get_type():
++        return DeviceSKUType.A10
++
++
+ @dataclass
+ class A100DeviceSKUConfig(BaseDeviceSKUConfig):
+     fp16_tflops: int = 312
+diff --git a/vidur/config/node_sku_config.py b/vidur/config/node_sku_config.py
+index ce2271f..65e89fa 100644
+--- a/vidur/config/node_sku_config.py
++++ b/vidur/config/node_sku_config.py
+@@ -22,6 +22,16 @@ class A40PairwiseNvlinkNodeSKUConfig(BaseNodeSKUConfig):
+         return NodeSKUType.A40_PAIRWISE_NVLINK
+ 
+ 
++@dataclass
++class A10PcieNodeSKUConfig(BaseNodeSKUConfig):
++    device_sku_type: DeviceSKUType = DeviceSKUType.A10
++    num_devices_per_node: int = 4
++
++    @staticmethod
++    def get_type():
++        return NodeSKUType.A10_PCIE
++
++
+ @dataclass
+ class A100PairwiseNvlinkNodeSKUConfig(BaseNodeSKUConfig):
+     device_sku_type: DeviceSKUType = DeviceSKUType.A100
+diff --git a/vidur/entities/request.py b/vidur/entities/request.py
+index 8f2d684..ac0d0c1 100644
+--- a/vidur/entities/request.py
++++ b/vidur/entities/request.py
+@@ -38,6 +38,8 @@ class Request(BaseEntity):
+         self._num_prefill_tokens = num_prefill_tokens
+         self._num_decode_tokens = num_decode_tokens
+         self._num_processed_tokens = num_processed_tokens
++        self._orig_num_prefill_tokens = num_prefill_tokens
++        self._orig_num_decode_tokens = num_decode_tokens
+ 
+         self._scheduled_at = 0
+         self._execution_time = 0
+diff --git a/vidur/events/batch_end_event.py b/vidur/events/batch_end_event.py
+index 9a7797d..fc7625d 100644
+--- a/vidur/events/batch_end_event.py
++++ b/vidur/events/batch_end_event.py
+@@ -20,6 +20,7 @@ class BatchEndEvent(BaseEvent):
+     def handle_event(
+         self, scheduler: BaseGlobalScheduler, metrics_store: MetricsStore
+     ) -> List[BaseEvent]:
++        from vidur.events.global_schedule_event import GlobalScheduleEvent
+         from vidur.events.replica_schedule_event import ReplicaScheduleEvent
+ 
+         self._batch.on_batch_end(self.time)
+@@ -31,6 +32,14 @@ class BatchEndEvent(BaseEvent):
+             self.time, self._batch, self._replica_id, memory_usage_percent
+         )
+ 
++        # Glia setup: the global scheduler is invoked on every request arrival
++        # *and* every request completion, so routers may hold requests in the
++        # global queue (admission control) and release them when memory frees up.
++        if any(request.completed for request in self._batch.requests):
++            return [
++                GlobalScheduleEvent(self.time),
++                ReplicaScheduleEvent(self.time, self._replica_id),
++            ]
+         return [ReplicaScheduleEvent(self.time, self._replica_id)]
+ 
+     def to_dict(self):
+diff --git a/vidur/events/global_schedule_event.py b/vidur/events/global_schedule_event.py
+index 3f0ab54..aba6271 100644
+--- a/vidur/events/global_schedule_event.py
++++ b/vidur/events/global_schedule_event.py
+@@ -26,6 +26,9 @@ class GlobalScheduleEvent(BaseEvent):
+ 
+         for replica_id, request in self._request_mapping:
+             self._replica_set.add(replica_id)
++            # telemetry: when/where the router released the request
++            request._routed_at = self.time
++            request._routed_to = replica_id
+             scheduler.get_replica_scheduler(replica_id).add_request(request)
+ 
+         return [
+diff --git a/vidur/scheduler/global_scheduler/custom_global_scheduler.py b/vidur/scheduler/global_scheduler/custom_global_scheduler.py
+new file mode 100644
+index 0000000..7983e72
+--- /dev/null
++++ b/vidur/scheduler/global_scheduler/custom_global_scheduler.py
+@@ -0,0 +1,35 @@
++import importlib.util
++import inspect
++import os
++import sys
++
++from vidur.scheduler.global_scheduler.base_global_scheduler import BaseGlobalScheduler
++
++
++def load_custom_global_scheduler(config, replicas):
++    """Import `module_path` and instantiate the requested BaseGlobalScheduler subclass."""
++    gs_config = config.cluster_config.global_scheduler_config
++    path = os.path.abspath(gs_config.module_path)
++    mod_name = "custom_gs_" + os.path.splitext(os.path.basename(path))[0]
++    spec = importlib.util.spec_from_file_location(mod_name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[mod_name] = module
++    spec.loader.exec_module(module)
++
++    if gs_config.class_name:
++        cls = getattr(module, gs_config.class_name)
++    else:
++        candidates = [
++            c
++            for _, c in inspect.getmembers(module, inspect.isclass)
++            if issubclass(c, BaseGlobalScheduler)
++            and c is not BaseGlobalScheduler
++            and c.__module__ == mod_name
++        ]
++        if len(candidates) != 1:
++            raise ValueError(
++                f"{path}: expected exactly one BaseGlobalScheduler subclass, found "
++                f"{[c.__name__ for c in candidates]}; set class_name"
++            )
++        cls = candidates[0]
++    return cls(config, replicas)
+diff --git a/vidur/scheduler/global_scheduler/global_scheduler_registry.py b/vidur/scheduler/global_scheduler/global_scheduler_registry.py
+index c2d505e..451ed44 100644
+--- a/vidur/scheduler/global_scheduler/global_scheduler_registry.py
++++ b/vidur/scheduler/global_scheduler/global_scheduler_registry.py
+@@ -1,3 +1,7 @@
++from vidur.scheduler.global_scheduler.custom_global_scheduler import (
++    load_custom_global_scheduler,
++)
++from vidur.scheduler.global_scheduler.llq_global_scheduler import LLQGlobalScheduler
+ from vidur.scheduler.global_scheduler.lor_global_scheduler import LORGlobalScheduler
+ from vidur.scheduler.global_scheduler.random_global_scheduler import (
+     RandomGlobalScheduler,
+@@ -20,3 +24,5 @@ GlobalSchedulerRegistry.register(
+     GlobalSchedulerType.ROUND_ROBIN, RoundRobinGlobalScheduler
+ )
+ GlobalSchedulerRegistry.register(GlobalSchedulerType.LOR, LORGlobalScheduler)
++GlobalSchedulerRegistry.register(GlobalSchedulerType.LLQ, LLQGlobalScheduler)
++GlobalSchedulerRegistry.register(GlobalSchedulerType.CUSTOM, load_custom_global_scheduler)
+diff --git a/vidur/scheduler/global_scheduler/llq_global_scheduler.py b/vidur/scheduler/global_scheduler/llq_global_scheduler.py
+new file mode 100644
+index 0000000..c145707
+--- /dev/null
++++ b/vidur/scheduler/global_scheduler/llq_global_scheduler.py
+@@ -0,0 +1,28 @@
++from typing import List, Tuple
++
++from vidur.entities import Request
++from vidur.scheduler.global_scheduler.base_global_scheduler import BaseGlobalScheduler
++
++
++class LLQGlobalScheduler(BaseGlobalScheduler):
++    """
++    Least-loaded queue (LLQ): route each request to the replica with the fewest
++    in-flight requests (pending + active), updating counts as requests are placed.
++    """
++
++    def schedule(self) -> List[Tuple[int, Request]]:
++        self.sort_requests()
++
++        load = {
++            replica_id: rs.num_pending_requests + rs.num_active_requests
++            for replica_id, rs in self._replica_schedulers.items()
++        }
++
++        request_mapping = []
++        while self._request_queue:
++            request = self._request_queue.pop(0)
++            replica_id = min(load.items(), key=lambda x: x[1])[0]
++            load[replica_id] += 1
++            request_mapping.append((replica_id, request))
++
++        return request_mapping
+diff --git a/vidur/scheduler/replica_scheduler/base_replica_scheduler.py b/vidur/scheduler/replica_scheduler/base_replica_scheduler.py
+index 2db5c33..db362fc 100644
+--- a/vidur/scheduler/replica_scheduler/base_replica_scheduler.py
++++ b/vidur/scheduler/replica_scheduler/base_replica_scheduler.py
+@@ -53,6 +53,8 @@ class BaseReplicaScheduler(ABC):
+         self._request_queue = []
+         self._num_allocated_blocks = 0
+         self._allocation_map = {}
++        # requests that currently hold KV-cache blocks on this replica
++        self._active_requests = {}
+ 
+         self._replica_stage_schedulers = {
+             stage_id: ReplicaStageScheduler(
+@@ -68,6 +70,28 @@ class BaseReplicaScheduler(ABC):
+     def num_pending_requests(self) -> int:
+         return len(self._request_queue)
+ 
++    @property
++    def num_active_requests(self) -> int:
++        return len(self._active_requests)
++
++    @property
++    def pending_queue(self) -> List[Request]:
++        """Requests routed here that hold no GPU memory yet (incl. restarted ones)."""
++        return self._request_queue
++
++    @property
++    def active_queue(self) -> List[Request]:
++        """Requests currently holding KV-cache blocks (running or between iterations)."""
++        return list(self._active_requests.values())
++
++    @property
++    def block_size(self) -> int:
++        return self._config.block_size
++
++    @property
++    def num_blocks(self) -> int:
++        return self._config.num_blocks
++
+     @property
+     def replica_id(self) -> int:
+         return self._replica_id
+@@ -120,6 +144,7 @@ class BaseReplicaScheduler(ABC):
+         for request_id in request_ids:
+             num_blocks = self._allocation_map.pop(request_id)
+             self._num_allocated_blocks -= num_blocks
++            self._active_requests.pop(request_id, None)
+ 
+         assert self._num_allocated_blocks >= 0
+ 
+diff --git a/vidur/scheduler/replica_scheduler/sarathi_replica_scheduler.py b/vidur/scheduler/replica_scheduler/sarathi_replica_scheduler.py
+index c033a18..c343c5e 100644
+--- a/vidur/scheduler/replica_scheduler/sarathi_replica_scheduler.py
++++ b/vidur/scheduler/replica_scheduler/sarathi_replica_scheduler.py
+@@ -43,6 +43,7 @@ class SarathiReplicaScheduler(BaseReplicaScheduler):
+                 request.num_prefill_tokens / self._config.block_size
+             )
+             self.allocate(request.id, num_required_blocks)
++            self._active_requests[request.id] = request
+             return
+ 
+         num_tokens_reserved = self._allocation_map[request.id] * self._config.block_size
+diff --git a/vidur/scheduler/replica_scheduler/vllm_replica_scheduler.py b/vidur/scheduler/replica_scheduler/vllm_replica_scheduler.py
+index eaa871c..7a10ad3 100644
+--- a/vidur/scheduler/replica_scheduler/vllm_replica_scheduler.py
++++ b/vidur/scheduler/replica_scheduler/vllm_replica_scheduler.py
+@@ -52,6 +52,7 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
+                 (request.num_prefill_tokens) / self._config.block_size
+             )
+             self.allocate(request.id, num_required_blocks)
++            self._active_requests[request.id] = request
+             return
+ 
+         num_tokens_reserved = self._allocation_map[request.id] * self._config.block_size
+diff --git a/vidur/simulator.py b/vidur/simulator.py
+index a8dbfb1..a792933 100644
+--- a/vidur/simulator.py
++++ b/vidur/simulator.py
+@@ -75,7 +75,11 @@ class Simulator:
+                 if chrome_trace:
+                     self._event_chrome_trace.append(chrome_trace)
+ 
+-        assert self._scheduler.is_empty() or self._terminate
++        if not (self._scheduler.is_empty() or self._terminate):
++            logger.warning(
++                f"Simulation drained with {len(self._scheduler._request_queue)} requests "
++                "still in the global queue (router never dispatched them)"
++            )
+ 
+         logger.info(f"Simulation ended at: {self._time}s")
+ 
+@@ -102,6 +106,7 @@ class Simulator:
+ 
+     def _init_event_queue(self) -> None:
+         requests = self._request_generator.generate()
++        self._requests = requests
+ 
+         for request in requests:
+             self._add_event(RequestArrivalEvent(request.arrived_at, request))
+diff --git a/vidur/types/device_sku_type.py b/vidur/types/device_sku_type.py
+index 9077efe..e506c66 100644
+--- a/vidur/types/device_sku_type.py
++++ b/vidur/types/device_sku_type.py
+@@ -5,3 +5,4 @@ class DeviceSKUType(BaseIntEnum):
+     A40 = 1
+     A100 = 2
+     H100 = 3
++    A10 = 4
+diff --git a/vidur/types/global_scheduler_type.py b/vidur/types/global_scheduler_type.py
+index 97c5134..c0a4fed 100644
+--- a/vidur/types/global_scheduler_type.py
++++ b/vidur/types/global_scheduler_type.py
+@@ -5,3 +5,5 @@ class GlobalSchedulerType(BaseIntEnum):
+     RANDOM = 1
+     ROUND_ROBIN = 2
+     LOR = 3
++    LLQ = 4
++    CUSTOM = 5
+diff --git a/vidur/types/node_sku_type.py b/vidur/types/node_sku_type.py
+index 4bcaabf..4370e16 100644
+--- a/vidur/types/node_sku_type.py
++++ b/vidur/types/node_sku_type.py
+@@ -7,3 +7,4 @@ class NodeSKUType(BaseIntEnum):
+     H100_PAIRWISE_NVLINK = 3
+     A100_DGX = 4
+     H100_DGX = 5
++    A10_PCIE = 6

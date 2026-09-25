@@ -1,0 +1,9 @@
+third_party/
+cache/
+results/_warm/
+results/warmup/
+__pycache__/
+*.pyc
+# per-request CSVs + Vidur's timestamped config dirs are large and regenerable
+results/**/requests.csv.gz
+results/*/*/seed*/20*/
