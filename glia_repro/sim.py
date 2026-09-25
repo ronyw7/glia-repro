@@ -75,6 +75,7 @@ def summarize(requests, sim_time: float, wall: float, scheduler) -> Dict:
     ttft = np.array([r._prefill_completed_at - r.arrived_at for r in done])
     routed = np.array([getattr(r, "_routed_at", np.nan) - r.arrived_at for r in done])
     restarts = np.array([r.num_restarts for r in done])
+    sched = np.array([r._scheduled_at - r.arrived_at for r in done])  # arrival -> first time on a GPU
     replicas = scheduler._replica_schedulers
     return {
         "num_requests": len(requests),
@@ -86,12 +87,44 @@ def summarize(requests, sim_time: float, wall: float, scheduler) -> Dict:
         "mean_ttft": float(ttft.mean()) if len(ttft) else float("nan"),
         "p90_ttft": float(np.percentile(ttft, 90)) if len(ttft) else float("nan"),
         "mean_global_queue_delay": float(np.nanmean(routed)) if len(routed) else float("nan"),
+        "mean_wait_before_gpu": float(sched.mean()) if len(sched) else float("nan"),
+        "mean_service": float((e2e - sched).mean()) if len(e2e) else float("nan"),
         "frac_restarted": float((restarts > 0).mean()) if len(restarts) else float("nan"),
         "mean_restarts": float(restarts.mean()) if len(restarts) else float("nan"),
         "makespan": float(sim_time),
         "num_blocks_per_replica": int(next(iter(replicas.values()))._config.num_blocks),
         "wall_seconds": wall,
     }
+
+
+class _ScaledExecutionTime:
+    """Stand-in for vidur's ExecutionTime with total/model time multiplied by a constant."""
+
+    def __init__(self, et, scale: float):
+        self._et, self.total_time, self.model_time = et, et.total_time * scale, et.model_time * scale
+
+    def __getattr__(self, name):
+        return getattr(self._et, name)
+
+
+def _apply_diagnostic_knobs():
+    """Env-var knobs for sensitivity experiments (not part of the paper setup):
+    GPU_TIME_SCALE  multiply every batch's execution time (0.8 = a 25% faster GPU)
+    KVSAVE_SCALE    multiply the attn_kv_cache_save op (its A100 source measurements look anomalous)
+    """
+    from vidur.execution_time_predictor.base_execution_time_predictor import BaseExecutionTimePredictor
+    from vidur.execution_time_predictor.sklearn_execution_time_predictor import SklearnExecutionTimePredictor
+
+    gpu = float(os.environ.get("GPU_TIME_SCALE", 1.0))
+    kvs = float(os.environ.get("KVSAVE_SCALE", 1.0))
+    if kvs != 1.0:
+        orig_kv = SklearnExecutionTimePredictor._get_attention_kv_cache_save_execution_time
+        SklearnExecutionTimePredictor._get_attention_kv_cache_save_execution_time = (
+            lambda self, batch: kvs * orig_kv(self, batch))
+    if gpu != 1.0:
+        orig = BaseExecutionTimePredictor.get_execution_time
+        BaseExecutionTimePredictor.get_execution_time = (
+            lambda self, batch, stage: _ScaledExecutionTime(orig(self, batch, stage), gpu))
 
 
 def run_one(router: str, trace_file: str, out_dir: str, env: Optional[Dict[str, str]] = None,
@@ -101,6 +134,8 @@ def run_one(router: str, trace_file: str, out_dir: str, env: Optional[Dict[str, 
         os.environ[k] = str(v)
     from vidur.simulator import Simulator
     from vidur.utils.random import set_seeds
+
+    _apply_diagnostic_knobs()
 
     os.makedirs(out_dir, exist_ok=True)
     config = build_config(router, trace_file, out_dir, **kw)
@@ -124,6 +159,7 @@ def run_one(router: str, trace_file: str, out_dir: str, env: Optional[Dict[str, 
             "e2e": (r._completed_at - r.arrived_at) if r.completed else np.nan,
             "ttft": (r._prefill_completed_at - r.arrived_at) if r.completed else np.nan,
             "routed_at": getattr(r, "_routed_at", np.nan), "replica": getattr(r, "_routed_to", -1),
+            "first_scheduled_at": r._scheduled_at if r.completed else np.nan,
             "num_restarts": r.num_restarts,
         } for r in sim._requests]).to_csv(os.path.join(out_dir, "requests.csv.gz"), index=False)
     return s

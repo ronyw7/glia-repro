@@ -1,0 +1,23 @@
+{
+  "num_requests": 7097,
+  "num_completed": 7097,
+  "mean_e2e": 13.077744070829949,
+  "p50_e2e": 8.605278465844762,
+  "p90_e2e": 22.17119726137726,
+  "p99_e2e": 121.02929453753241,
+  "mean_ttft": 0.11044194290482136,
+  "p90_ttft": 0.23753238172880659,
+  "mean_global_queue_delay": 0.0,
+  "mean_wait_before_gpu": 0.012108620076715102,
+  "mean_service": 13.065635450753234,
+  "frac_restarted": 0.0,
+  "mean_restarts": 0.0,
+  "makespan": 1192.1927209330565,
+  "num_blocks_per_replica": 3328,
+  "wall_seconds": 134.34239053726196,
+  "router": "rr",
+  "trace": "data/traces/first_turn/sharegpt_first_turn_7.5_seed1.csv",
+  "env": {},
+  "num_replicas": 64,
+  "num_blocks": 3328
+}

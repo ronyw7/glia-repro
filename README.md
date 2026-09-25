@@ -65,6 +65,49 @@ HRA is best and FunSearch second at every budget. How much they win by grows wit
 pressure. The multi-turn reading of ShareGPT saturates the cluster at 7.5 QPS (every baseline
 ~355 s, `results/multi_turn_kv4096`), so it is not the paper's operating point ("7.5 QPS sits at the knee").
 
+### What explains the remaining gap (GPU speed x KV capacity)
+
+Two quantities the paper does not pin down trade off against each other: how fast the simulated A10 is,
+and how much KV cache each replica has. Fitting KV so that LLQ matches the paper constrains only their
+*combination*. It does not constrain HRA, because the two routers spend their time differently:
+
+| At 3328 blocks | Mean RT | Wait before first GPU slot | Service on GPU | Restarted |
+|---|---|---|---|---|
+| LLQ | 60.9 s | 34.8 s | 26.1 s | 18% |
+| HRA | 31.4 s | 6.6 s | 24.8 s | 8% |
+
+LLQ is dominated by waiting (memory pressure), while HRA is dominated by service time (GPU speed). The
+paper's Sec. 3.3 implies ~20 s of service for HRA (23 s with 3 s queueing). Here it is ~25 s, against an
+unloaded floor of 13.5 s (`results/diagnostics/ideal_64replicas`).
+
+The test: scale every GPU execution time by a constant (`GPU_TIME_SCALE`), re-fit KV so LLQ again
+matches the paper, and rerun everything (`results/diagnostics/speed*`):
+
+| GPU time x | KV blocks | RR | LOR | LLQ | LLQ restarted | FunSearch | HRA | HRA vs LLQ |
+|---|---|---|---|---|---|---|---|---|
+| 0.7 | 2048 | - | - | 46.9 | 24% | 24.4 | 21.5 | 2.18x |
+| **0.8** | **2432** | **63.8** | **52.8** | **52.5** | **22%** | **27.8** | **24.8** | **2.12x** |
+| 1.0 (headline) | 3328 | 69.4 | 62.8 | 60.9 | 18% | 34.6 | 31.4 | 1.94x |
+| 1.2 | 4352 | - | - | 66.0 | 13% | 40.6 | 38.1 | 1.73x |
+| *paper* | ? | *63.4* | *59.6* | *54.6* | *26%* | *32.5* | *24.1* | *2.27x* |
+
+A GPU ~25% faster than the synthesized A10 profile, with ~2400 KV blocks per replica, reproduces RR, LLQ
+and HRA to within a few percent. The paper's 26% LLQ restart rate (Sec. 3.3) also points to this corner.
+~2400 blocks is also much closer to what vLLM really leaves on a 24 GB A10 (~2100) than Vidur's planner
+default (4096). So the most likely cause is that the synthesized **A10 profile is too slow, and the KV
+fit compensated with too much memory**.
+
+One concrete source of slowness: the `attn_kv_cache_save` op in Vidur's A100 Llama-3-8B profile
+(4.7 ms/layer at >4K tokens, scaled 3.8x to 17.8 ms on the A10). That is implausibly slow for a ~34 MB
+copy, and its predictor fit has 101% MAPE. Zeroing it (`KVSAVE_SCALE=0`) alone moves LLQ from 60.9 to
+48.5 s and HRA from 31.4 to 28.1 s at 3328 blocks.
+
+Still unexplained: the FunSearch router is better here than the paper's FunSearch bar (27.8 vs 32.5 s at
+the 0.8x point). Fig. 13 is "an example" program, while the 32.5 s bar averages the best program from 10
+separate FunSearch runs, so the two need not match. LOR ties LLQ here, whereas the paper has it 9% worse.
+Note: the Fig. 13 code keys its bookkeeping on Python `id()`, so its results vary by ~0.5% run to run.
+All other routers are deterministic.
+
 ### A hint for beating HRA
 
 In first-turn ShareGPT, output length is essentially independent of prompt length
@@ -127,6 +170,7 @@ data/traces/<workload>/      the exact traces used (seeds 0-9)
 routers/                     glia_hra.py, funsearch_fig13.py, ablation_hra_fifo.py, template_router.py
 glia_repro/run.py            run routers x seeds in parallel; prints per-router summary
 glia_repro/report.py         aggregate -> results/<tag>/summary.{csv,md}, mean_rt.png
+                             (diagnostic env knobs in glia_repro/sim.py: GPU_TIME_SCALE, KVSAVE_SCALE)
 results/                     summaries + per-request CSVs for every run reported here
 ```
 
